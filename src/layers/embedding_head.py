@@ -1,3 +1,5 @@
+from turtle import forward
+
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -70,3 +72,27 @@ class VocabParallelEmbedding(nn.Module):
             # 由于只有正确的 GPU 输出非零值，sum 结果即完整 embedding
             dist.all_reduce(output, op=dist.ReduceOp.SUM)
         return output
+
+class ParallelLMHead(VocabParallelEmbedding):
+    def __init__(self, num_embeddings: int, embedding_dim: int):
+        super().__init__(num_embeddings, embedding_dim)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        
+        context = get_context(x)
+
+        if context.is_prefill:
+            last_token = context.cu_seqlens_q[1:] - 1
+            x = x[last_token].contiguous()
+        
+        logits = torch.nn.functional.linear(x, self.weight, bias=False)
+
+        if self.tp_size > 1:
+            all_logits = [torch.empty(logits.size(), device=logits.device) for _ in range(self.tp_size)] if self.tp_rank == 0 else None
+            dist.gather(logits, gather_list=all_logits, dst=0)
+            if self.tp_rank == 0:
+                # 拼接: (batch, padded_vocab_size)
+                logits = torch.cat(all_logits, dim=-1)
+                # 裁剪到原始 vocab_size
+                logits = logits[..., :self.num_embeddings]
+
+        return logits
