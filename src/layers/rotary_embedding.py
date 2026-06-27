@@ -1,3 +1,5 @@
+from turtle import forward
+
 import torch.nn as nn
 import torch
 
@@ -53,3 +55,65 @@ class RotaryEmbedding(nn.Module):
         rotary_embedding: 应用 RoPE 的维度数（通常等于 head_dim）
         max_position: 预计算缓存的最大位置数
     """
+    def __init__(
+        self, 
+        base:int,
+        rotary_embedding: int, 
+        max_position: int = 2048,
+        is_llama3: bool = False,
+        # 【Llama 3.2 专用参数】NTK-aware 频率缩放
+        llama3_rope_factor: float = 32.0,
+        llama3_rope_high_freq_factor: float = 4.0,
+        llama3_rope_low_freq_factor: float = 1.0,
+        llama3_rope_original_max_position_embeddings: int = 8192,
+    ):
+        super().__init__()
+        self.base = base
+        self.rotary_embedding = rotary_embedding
+        self.max_position = max_position
+
+        self.inv_freq = 1/(base ** (torch.arange(0, self.rotary_embedding, 2)/self.rotary_embedding))
+
+        if is_llama3:
+            # 【Llama 3.2 NTK-aware 频率缩放】
+            # 核心思想：不同波长的维度需要不同的频率缩放因子
+            #   - 短波长（高频）= 短距离依赖 → 不缩放或小缩放
+            #   - 长波长（低频）= 长距离依赖 → 大缩放
+            import math
+            inv_freq = self.inv_freq
+            wave_len = 2 * math.pi / inv_freq  # 每个频率对应的波长
+            if llama3_rope_low_freq_factor == llama3_rope_high_freq_factor:
+                # 无平滑过渡：硬阈值
+                inv_freq = torch.where(
+                    wave_len < llama3_rope_original_max_position_embeddings / llama3_rope_high_freq_factor,
+                    inv_freq,
+                    inv_freq / llama3_rope_factor,
+                )
+            else:
+                # 有平滑过渡：根据波长线性插值缩放因子
+                delta = llama3_rope_high_freq_factor - llama3_rope_low_freq_factor
+                smooth = (llama3_rope_original_max_position_embeddings / wave_len - llama3_rope_low_freq_factor) / delta
+                smooth = torch.clamp(smooth, 0, 1)
+                factor = (1 - smooth) / llama3_rope_factor + smooth
+                inv_freq = factor * inv_freq
+            self.inv_freq = inv_freq
+
+        # 预计算 cos/sin的缓存
+        positions = torch.arange(self.max_position).float()
+        freqs = torch.einsum("i,j -> ij", positions, self.inv_freq)
+
+        cos = torch.cos(freqs)
+        sin = torch.sin(freqs)
+
+        cos_sin_cache = torch.cat([cos, sin], dim=-1)
+        # 【register_buffer】注册为 buffer（非参数张量），随模型一同加载/保存/移动设备
+        self.register_buffer("cos_sin_cache", cos_sin_cache)
+    
+    @torch.compile
+    def forward(self, positions, query, key):
+        cos_sin = self.cos_sin_cache[positions]  # 查表获取 cos 和 sin
+        cos, sin = cos_sin.chunk(2, dim=-1)       # 拆分 cos/sin 两半
+        return (
+            apply_rotary_pos_emb(query, cos, sin),
+            apply_rotary_pos_emb(key, cos, sin)
+        )
