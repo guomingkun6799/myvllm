@@ -216,7 +216,7 @@ def flash_attention_prefill(
         - head_dim 越小，每个元素占用显存越少，可以用更大的 block
         - 限制因素是 SRAM 大小（通常 48KB-256KB）
         - 太大的 block 会导致 """
-        q = q.contiguous()
+    q = q.contiguous()
     k = k.contiguous()
     v = v.contiguous()
     
@@ -254,3 +254,249 @@ def flash_attention_prefill(
     )
     
     return output
+
+@trition.jit
+def paged_attention_decode_kernel(
+    output_ptr,      # [输出] Attention 结果
+    query_ptr,       # [输入] Q 值 (batch_size, num_heads, head_dim)
+    k_cache_ptr,     # [输入] K 缓存池 (num_blocks, block_size, num_kv_heads, head_dim)
+    v_cache_ptr,     # [输入] V 缓存池
+    block_tables_ptr,    # [输入] 块表 (batch_size, max_num_blocks)
+    context_lens_ptr,    # [输入] 各序列的上下文长度
+    scale: tl.constexpr,
+    num_heads: tl.constexpr,
+    num_kv_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    block_size: tl.constexpr,
+    max_num_blocks: tl.constexpr,
+    BLOCK_N: tl.constexpr,  # 每次处理的 KV token 块大小
+):
+    """
+    【PagedAttention Decode Kernel】
+    
+    Decode 阶段的特殊场景：
+    - 每个序列只有 1 个 Q token，需要 attend 到大量历史 KV token
+    - KV 分散在不同物理块中（分页存储），不能直接连续读取
+    
+    本 kernel 通过 block_tables（块表）将逻辑位置映射到物理块，
+    逐块从 KV cache 中加载并计算 attention。
+    
+    【Grid 设计】
+        - program_id(0): batch_idx  — 序列索引
+        - program_id(1): head_idx   — Q head 索引
+        每个线程处理一个序列的一个 head
+    """
+    batch_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+    
+    # GQA 映射
+    kv_head_idx = head_idx // (num_heads // num_kv_heads)
+    
+    context_len = tl.load(context_lens_ptr + batch_idx)
+    
+    # 加载单个 Q 向量 (head_dim,)
+    offs_d = tl.arange(0, head_dim)
+    q_offset = batch_idx * num_heads * head_dim + head_idx * head_dim + offs_d
+    q = tl.load(query_ptr + q_offset)
+    
+    # Online Softmax 状态
+    acc = tl.zeros([head_dim], dtype=tl.float32)
+    l_i = 0.0
+    m_i = -1e10
+    
+    max_chunks = tl.cdiv(max_num_blocks * block_size, BLOCK_N)
+
+    for chunk_idx in range(max_chunks):
+        token_start = chunk_idx * BLOCK_N
+
+    if token_start < context_len:
+        offs_n = token_start + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < context_len
+
+        for i in range(BLOCK_N):
+            token_idx = token_start + i
+            if token_idx < context_len:
+                block_num = token_idx // block_size
+                block_offset = token_idx % block_size
+
+                if block_num < max_num_blocks:
+                    block_table_offset = batch_idx * max_num_blocks + block_num
+                    physical_block_idx = tl.load(block_tables_ptr + block_table_offset)
+
+                    if physical_block_idx != -1:
+                        k_offset = (physical_block_idx * block_size * num_kv_heads * head_dim +
+                                block_offset * num_kv_heads * head_dim +
+                                kv_head_idx * head_dim + offs_d)
+                        k_vec = tl.load(k_cache_ptr + k_offset)
+
+                        score = tl.sum(q * k_vec) * scale
+
+                        mask_i = tl.arange(0, BLOCK_N) == i
+                        qk = tl.where(mask_i, score, qk)
+        
+        qk = tl.where(mask_n, qk, -1e10)
+        
+        m_ij = tl.max(qk)
+        m_i_new = tl.maximum(m_i, m_ij)
+        alpha = tl.exp(m_i - m_i_new)
+        p = tl.exp(qk - m_i_new)
+
+        acc = acc * alpha
+        l_i = l_i * alpha
+
+        #开始累积v
+        for i in range(BLOCK_N):
+            token_idx = token_start + i
+            if token_idx < context_len:
+                block_num = token_idx // block_size
+                block_offset = token_idx % block_size
+
+                if block_num < max_num_blocks:
+                    block_table_offset = batch_idx * max_num_blocks + block_num
+                    physical_block_idx = tl.load(block_tables_ptr + block_table_offset)
+
+                    if physical_block_idx != -1:
+                        v_offset = (physical_block_idx * block_size * num_kv_heads * head_dim +
+                                block_offset * num_kv_heads * head_dim +
+                                kv_head_idx * head_dim + offs_d)
+                        v_vec = tl.load(v_cache_ptr + v_offset)
+
+                        mask_i = tl.arange(0, BLOCK_N) == i
+                        weight_i = tl.sum(tl.where(mask_i, p, 0.0))
+
+                        acc = acc + weight_i * v_vec
+                        l_i = l_i + weight_i    
+        m_i = m_i_new
+
+            # 归一化输出
+    output = acc / l_i
+    
+    output_offset = batch_idx * num_heads * head_dim + head_idx * head_dim + offs_d
+    tl.store(output_ptr + output_offset, output)
+
+
+def paged_attention_decode(
+    query: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    scale: float,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    block_size: int
+) -> torch.Tensor:
+    """
+    Decode 阶段的 PagedAttention 封装。
+    
+    与 FlashAttention prefill 对比：
+    - Q shape: (batch_size, num_heads, head_dim) — 每个序列只有 1 个 token
+    - KV 从分页缓存池读取：不连续存储，通过 block_tables 映射
+    - block_tables[i][j] = 序列 i 的第 j 个逻辑块对应的物理块 ID
+    """
+    batch_size = query.shape[0]
+    max_num_blocks = block_tables.shape[1]
+    
+    query = query.contiguous()
+    output = torch.empty_like(query)
+    
+    BLOCK_N = 64 if head_dim <= 128 else 32
+    
+    # Grid: (batch_size, num_heads) — 每个 (序列, head) 启动一个线程
+    grid = (batch_size, num_heads)
+    
+    paged_attention_decode_kernel[grid](
+        output, query, k_cache, v_cache,
+        block_tables, context_lens,
+        scale=scale,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        block_size=block_size,
+        max_num_blocks=max_num_blocks,
+        BLOCK_N=BLOCK_N,
+    )
+    
+    return output
+
+class Attention(nn.Module):
+    """
+    整合了 KV Cache 存储、FlashAttention (prefill) 和 PagedAttention (decode)
+    的完整 Attention 层。
+    
+    【Forward 逻辑】
+        1. 将当前计算的 K, V 存入 KV cache（如果 cache 已分配）
+        2. 如果是 Prefill: 调用 flash_attention_prefill (varlen)
+        3. 如果是 Decode:  调用 paged_attention_decode (从 cache 读取)
+    """
+    def __init__(
+        self,
+        num_heads: int,
+        head_dim: int,
+        scale: float = 1.0,
+        num_kv_heads: int = None,
+        block_size: int = 16,
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.scale = scale
+        # 【GQA】num_kv_heads 可以小于 num_heads（默认等于）
+        self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
+        self.block_size = block_size
+        # KV cache 初始化为空张量，由 ModelRunner.allocate_kv_cache() 分配
+        self.k_cache = self.v_cache = torch.tensor([])
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            q: Prefill 时 (total_tokens, num_heads, head_dim)
+               Decode 时  (batch_size, num_heads, head_dim)
+            k, v: 与 q 对应
+        
+        Returns:
+            (total_tokens_or_batch_size, num_heads * head_dim) — 合并 head 维度
+        """
+        context = get_context()
+        k_cache, v_cache = self.k_cache, self.v_cache
+
+        # ===== Step 1: 存储当前 KV 到缓存 =====
+        if k_cache.numel() > 0 and v_cache.numel() > 0 and context.slot_mapping is not None:
+            # 处理 4D batched → 3D varlen 的转换
+            if k.dim() == 4:
+                B, N, num_kv_heads, head_dim = k.shape
+                k_to_store = k.reshape(B * N, num_kv_heads, head_dim).contiguous()
+                v_to_store = v.reshape(B * N, num_kv_heads, head_dim).contiguous()
+            else:
+                k_to_store = k.contiguous()
+                v_to_store = v.contiguous()
+            
+            store_kvcache(k_to_store, v_to_store, k_cache, v_cache, context.slot_mapping, self.block_size)
+
+        # 计算 scale = 1 / sqrt(head_dim)
+        scale = self.scale / (self.head_dim ** 0.5)
+
+        # ===== Step 2: 选择 Attention 算法 =====
+        if context.is_prefill:
+            # 【Prefill】使用 FlashAttention（varlen 模式）
+            cu_seqlens = context.cu_seqlens_q
+            if cu_seqlens is None:
+                raise ValueError("cu_seqlens_q must be provided for varlen attention")
+            
+            o = flash_attention_prefill(q, k, v, cu_seqlens, scale, 
+                                        self.num_heads, self.num_kv_heads, self.head_dim)
+            return o.reshape(o.shape[0], self.num_heads * self.head_dim)
+        else:
+            # 【Decode】使用 PagedAttention（从 KV cache 读取历史）
+            o = paged_attention_decode(
+                q, k_cache, v_cache,
+                context.block_tables,
+                context.context_lens,
+                scale,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.block_size
+            )
+            return o.reshape(o.shape[0], self.num_heads * self.head_dim)
